@@ -1,0 +1,25 @@
+services:
+  nanobroker:
+    build: .
+    container_name: nexo_nanobroker
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - nanobroker_data:/data
+    environment:
+      - NANOBROKER_DB_FILE=/data/broker_local.db
+      - NANOBROKER_HOST=0.0.0.0
+      - NANOBROKER_PORT=8000
+      - NANOBROKER_MAX_FAST_ATTEMPTS=3
+      - NANOBROKER_LOG_LEVEL=INFO
+      - NANOBROKER_DB_TIMEOUT=5
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; exit(0 if urllib.request.urlopen('http://localhost:8000/health').read() else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  nanobroker_data:
