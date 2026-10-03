@@ -10,9 +10,12 @@ from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
+
+import re
 
 load_dotenv()
 
@@ -25,6 +28,15 @@ PORT = int(os.getenv("NANOBROKER_PORT", "8000"))
 LOG_LEVEL = os.getenv("NANOBROKER_LOG_LEVEL", "INFO").upper()
 DB_TIMEOUT = int(os.getenv("NANOBROKER_DB_TIMEOUT", "1"))
 JANITOR_INTERVAL_SEC = int(os.getenv("NANOBROKER_JANITOR_INTERVAL_SEC", "30"))
+API_KEY = os.getenv("NANOBROKER_API_KEY", "")
+ADMIN_KEY = os.getenv("NANOBROKER_ADMIN_KEY", "")
+CORS_ORIGINS = [o.strip() for o in os.getenv("NANOBROKER_CORS_ORIGINS", "*").split(",") if o.strip()]
+RATE_LIMIT_PER_MIN = int(os.getenv("NANOBROKER_RATE_LIMIT_PER_MIN", "120"))
+MAX_BODY_KB = int(os.getenv("NANOBROKER_MAX_BODY_KB", "256"))
+MAX_PEEK_LIMIT = int(os.getenv("NANOBROKER_MAX_PEEK", "100"))
+_QUEUE_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_PATTERN_RE = re.compile(r"^[%A-Za-z0-9._-]{1,64}$")
+_rate_buckets: dict[tuple[str, str], list[float]] = {}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -76,6 +88,13 @@ def init_storage():
             CREATE INDEX IF NOT EXISTS idx_queue_fifo_v2
             ON message_store(queue_name, visible_after, expires_at, id ASC)
         """)
+        try:
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_unique_queue_event
+                ON message_store(queue_name, event_id)
+            """)
+        except (sqlite3.OperationalError, sqlite3.IntegrityError) as exc:
+            logger.warning("Idempotency index skipped (existing duplicates?): %s", exc)
 
         # Migration: add columns for databases created before v2
         for col, col_type in [
@@ -145,11 +164,62 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _bearer_token(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
+
+
+def _check_rate_limit(request: Request) -> None:
+    if RATE_LIMIT_PER_MIN <= 0:
+        return
+    client_ip = request.client.host if request.client else "unknown"
+    token = _bearer_token(request)
+    key = (client_ip, token[-8:] if token else "")
+    now = time.time()
+    window_start = now - 60.0
+    hits = [t for t in _rate_buckets.get(key, []) if t > window_start]
+    if len(hits) >= RATE_LIMIT_PER_MIN:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    hits.append(now)
+    _rate_buckets[key] = hits
+
+
+def require_api(request: Request) -> str:
+    _check_rate_limit(request)
+    if not API_KEY:
+        return "open"
+    token = _bearer_token(request)
+    if token and (token == API_KEY or (ADMIN_KEY and token == ADMIN_KEY)):
+        return "ok"
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def require_admin(request: Request) -> str:
+    _check_rate_limit(request)
+    if not ADMIN_KEY:
+        return "open"
+    if _bearer_token(request) == ADMIN_KEY:
+        return "ok"
+    raise HTTPException(status_code=403, detail="Admin required")
+
+
+def _validate_queue_or_400(queue_name: str) -> None:
+    if not _QUEUE_RE.match(queue_name or ""):
+        raise HTTPException(status_code=400, detail="Invalid queue name")
+
+
+def _validate_pattern_or_400(pattern: str) -> None:
+    if not _PATTERN_RE.match(pattern or ""):
+        raise HTTPException(status_code=400, detail="Invalid pattern")
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -191,9 +261,14 @@ _POP_SELECT = "id, queue_name, event_id, event_type, timestamp, payload, retry_c
 def push_router(
     queue_name: str,
     envelope: EventEnvelope,
+    request: Request,
     max_retries: int = 5,
     ttl: Optional[int] = None,
+    _auth: str = Depends(require_api),
 ):
+    _validate_queue_or_400(queue_name)
+    if len(json.dumps(envelope.payload)) > MAX_BODY_KB * 1024:
+        raise HTTPException(status_code=413, detail="Payload too large")
     expires_at = (time.time() + ttl) if ttl is not None else None
     try:
         with _db_conn() as conn:
@@ -210,6 +285,10 @@ def push_router(
                 ),
             )
         return {"status": "ACK", "queue": queue_name, "event_id": envelope.event_id}
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Duplicate event_id in queue")
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("Push failed: %s", exc)
         raise HTTPException(status_code=500, detail="Storage Write Error") from exc
@@ -222,7 +301,8 @@ def push_router(
     status_code=status.HTTP_200_OK,
     summary="Consume the oldest message atomically (non-destructive, must ack/nack)",
 )
-def pop_dispatcher(queue_name: str, visibility_timeout: int = 30):
+def pop_dispatcher(queue_name: str, request: Request, visibility_timeout: int = 30, _auth: str = Depends(require_api)):
+    _validate_queue_or_400(queue_name)
     now = time.time()
     conn = _db_conn()
     try:
@@ -267,7 +347,8 @@ def pop_dispatcher(queue_name: str, visibility_timeout: int = 30):
     status_code=status.HTTP_200_OK,
     summary="Consume the oldest message from any queue matching a LIKE pattern",
 )
-def pop_by_pattern(pattern: str, visibility_timeout: int = 30):
+def pop_by_pattern(request: Request, pattern: str, visibility_timeout: int = 30, _auth: str = Depends(require_api)):
+    _validate_pattern_or_400(pattern)
     now = time.time()
     conn = _db_conn()
     try:
@@ -319,7 +400,7 @@ def pop_by_pattern(pattern: str, visibility_timeout: int = 30):
     status_code=status.HTTP_200_OK,
     summary="Acknowledge a message by ID (deletes it from the queue)",
 )
-def ack_message(message_id: int):
+def ack_message(message_id: int, request: Request, _auth: str = Depends(require_api)):
     global _processed_total
     try:
         with _db_conn() as conn:
@@ -342,7 +423,7 @@ def ack_message(message_id: int):
     status_code=status.HTTP_200_OK,
     summary="Negative acknowledgement — retry or move to poison queue",
 )
-def nack_message(message_id: int):
+def nack_message(message_id: int, request: Request, _auth: str = Depends(require_api)):
     conn = _db_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -402,7 +483,9 @@ def nack_message(message_id: int):
     status_code=status.HTTP_200_OK,
     summary="View messages without consuming them. Default limit=1 returns a single object; limit>1 returns a list.",
 )
-def peek_queue(queue_name: str, limit: int = 1):
+def peek_queue(queue_name: str, request: Request, limit: int = 1, _auth: str = Depends(require_api)):
+    _validate_queue_or_400(queue_name)
+    limit = max(1, min(limit, MAX_PEEK_LIMIT))
     try:
         with _db_conn() as conn:
             rows = conn.execute(
@@ -440,7 +523,8 @@ def peek_queue(queue_name: str, limit: int = 1):
     status_code=status.HTTP_200_OK,
     summary="Count messages in a specific queue",
 )
-def count_queue(queue_name: str):
+def count_queue(queue_name: str, request: Request, _auth: str = Depends(require_api)):
+    _validate_queue_or_400(queue_name)
     try:
         with _db_conn() as conn:
             row = conn.execute(
@@ -460,7 +544,7 @@ def count_queue(queue_name: str):
     status_code=status.HTTP_200_OK,
     summary="List all queue names with non-zero backlog",
 )
-def list_queues():
+def list_queues(request: Request, _auth: str = Depends(require_admin)):
     try:
         with _db_conn() as conn:
             rows = conn.execute(
@@ -481,7 +565,8 @@ def list_queues():
     status_code=status.HTTP_200_OK,
     summary="Delete all messages in a queue (emergency maintenance)",
 )
-def purge_queue(queue_name: str):
+def purge_queue(queue_name: str, request: Request, _auth: str = Depends(require_admin)):
+    _validate_queue_or_400(queue_name)
     try:
         with _db_conn() as conn:
             cursor = conn.execute("DELETE FROM message_store WHERE queue_name = ?", (queue_name,))
@@ -499,7 +584,7 @@ def purge_queue(queue_name: str):
     "/api/v1/system/stats",
     summary="Backlog per queue",
 )
-def system_stats():
+def system_stats(request: Request, _auth: str = Depends(require_admin)):
     try:
         with _db_conn() as conn:
             rows = conn.execute(
@@ -517,6 +602,112 @@ def system_stats():
     except Exception as exc:
         logger.error("Stats error: %s", exc)
         raise HTTPException(status_code=500, detail="Stats Error") from exc
+
+# ---------------------------------------------------------------------------
+# DLQ endpoints (failed_* queues)
+# ---------------------------------------------------------------------------
+@app.get("/api/v1/system/dlq", summary="List poison messages in failed_* queues")
+def list_dlq(request: Request, limit: int = 100, _auth: str = Depends(require_admin)):
+    limit = max(1, min(limit, MAX_PEEK_LIMIT))
+    try:
+        with _db_conn() as conn:
+            rows = conn.execute(
+                f"SELECT {_POP_SELECT}, queue_name FROM message_store WHERE queue_name LIKE 'failed_%' ORDER BY id ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        msgs = [
+            {
+                "id": r["id"],
+                "queue_name": r["queue_name"],
+                "event_id": r["event_id"],
+                "event_type": r["event_type"],
+                "timestamp": r["timestamp"],
+                "payload": json.loads(r["payload"]),
+                "retry_count": r["retry_count"],
+                "max_retries": r["max_retries"],
+            }
+            for r in rows
+        ]
+        return {"messages": msgs, "count": len(msgs)}
+    except Exception as exc:
+        logger.error("DLQ list failed: %s", exc)
+        raise HTTPException(status_code=500, detail="DLQ Error") from exc
+
+
+@app.post("/api/v1/system/dlq/{message_id}/requeue", summary="Requeue a poison message to its original queue")
+def requeue_dlq(message_id: int, request: Request, _auth: str = Depends(require_admin)):
+    conn = _db_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT queue_name FROM message_store WHERE id = ?", (message_id,)
+        ).fetchone()
+        if not row:
+            conn.commit()
+            raise HTTPException(status_code=404, detail="Message Not Found")
+        orig = row["queue_name"]
+        if orig.startswith("failed_"):
+            orig = orig[len("failed_"):]
+        _validate_queue_or_400(orig)
+        conn.execute(
+            "UPDATE message_store SET queue_name = ?, retry_count = 0, visible_after = 0 WHERE id = ?",
+            (orig, message_id),
+        )
+        conn.commit()
+        return {"status": "REQUEUED", "id": message_id, "queue": orig}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail="Requeue Error") from exc
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Metrics (Prometheus) + Dashboard
+# ---------------------------------------------------------------------------
+@app.get("/metrics", summary="Prometheus metrics")
+def metrics():
+    try:
+        with _db_conn() as conn:
+            rows = conn.execute(
+                "SELECT queue_name, COUNT(*) AS pending FROM message_store GROUP BY queue_name"
+            ).fetchall()
+        total = sum(r["pending"] for r in rows)
+        lines = [
+            "# HELP nanobroker_backlog Messages pending per queue",
+            "# TYPE nanobroker_backlog gauge",
+        ]
+        for r in rows:
+            lines.append(f'nanobroker_backlog{{queue="{r["queue_name"]}"}} {r["pending"]}')
+        lines += [
+            "# HELP nanobroker_queues Number of active queues",
+            "# TYPE nanobroker_queues gauge",
+            f"nanobroker_queues {len(rows)}",
+            "# HELP nanobroker_processed_total Messages acked since boot",
+            "# TYPE nanobroker_processed_total counter",
+            f"nanobroker_processed_total {_processed_total}",
+        ]
+        return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Metrics Error") from exc
+
+
+@app.get("/", response_class=HTMLResponse, summary="Minimal dashboard")
+def dashboard():
+    try:
+        with _db_conn() as conn:
+            rows = conn.execute(
+                "SELECT queue_name, COUNT(*) AS pending FROM message_store GROUP BY queue_name ORDER BY queue_name"
+            ).fetchall()
+        items = "".join(f"<li><b>{r['queue_name']}</b>: {r['pending']}</li>" for r in rows) or "<li>Sin mensajes</li>"
+        return f"""<html><head><title>NanoBroker</title></head><body style="font-family:sans-serif;max-width:640px;margin:2em auto">
+        <h1>NanoBroker</h1><p>Motor: SQLite WAL · <a href="/docs">/docs</a> · <a href="/metrics">/metrics</a> · <a href="/health">/health</a></p>
+        <h2>Colas activas</h2><ul>{items}</ul></body></html>"""
+    except Exception:
+        return HTMLResponse("<h1>NanoBroker</h1><p>Error leyendo colas</p>", status_code=500)
+
 
 # ---------------------------------------------------------------------------
 # Health check

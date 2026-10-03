@@ -384,8 +384,8 @@ def test_pop_by_pattern_can_target_failed(client):
 
 def test_list_queues(client):
     client.post("/api/v1/push/alpha", json=SAMPLE_MESSAGE)
-    client.post("/api/v1/push/beta", json=SAMPLE_MESSAGE)
-    client.post("/api/v1/push/beta", json=SAMPLE_MESSAGE)
+    client.post("/api/v1/push/beta", json={**SAMPLE_MESSAGE, "event_id": "msg-001-b1"})
+    client.post("/api/v1/push/beta", json={**SAMPLE_MESSAGE, "event_id": "msg-001-b2"})
 
     resp = client.get("/api/v1/system/queues")
     assert resp.status_code == 200
